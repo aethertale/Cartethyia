@@ -693,6 +693,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
   }
 
   private async accountsWithUsage(
+    db: CartethyiaDatabase | Parameters<Parameters<CartethyiaDatabase["transaction"]>[0]>[0],
     tenantId: string,
     rows: readonly (typeof providerAccounts.$inferSelect)[],
   ): Promise<readonly ProviderAccountResponse[]> {
@@ -700,8 +701,10 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
     const accountIds = rows.map((row) => row.id);
-    const [todayRows, lifetimeRows] = await Promise.all([
-      this.db
+    // Single-connection drivers (PGlite) deadlock when a second statement is
+    // awaited while the first is still in flight on the same session: the
+    // queries must be serialized, never fanned out with Promise.all.
+    const todayRows = await db
         .select({
           accountId: telemetryEvents.accountId,
           requests: sql<number>`count(*)`,
@@ -720,8 +723,8 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
             gte(telemetryEvents.createdAt, todayStart),
           ),
         )
-        .groupBy(telemetryEvents.accountId),
-      this.db
+        .groupBy(telemetryEvents.accountId);
+    const lifetimeRows = await db
         .select()
         .from(telemetryUsageTotals)
         .where(
@@ -730,8 +733,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
             eq(telemetryUsageTotals.identityType, "account"),
             inArray(telemetryUsageTotals.entityId, accountIds),
           ),
-        ),
-    ]);
+        );
     const todayByAccount = new Map<string, (typeof todayRows)[number]>();
     for (const row of todayRows) {
       if (row.accountId !== null) todayByAccount.set(row.accountId, row);
@@ -839,7 +841,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       // same millisecond could swap between loads. `id` breaks a tie so the
       // order is total even before a reorder assigns distinct indices.
       .orderBy(asc(providerAccounts.sortIndex), asc(providerAccounts.createdAt), asc(providerAccounts.id));
-    return this.accountsWithUsage(tenantId, rows);
+    return this.accountsWithUsage(this.db, tenantId, rows);
   }
 
   async listAllAccounts(tenantId: string): Promise<readonly ProviderAccountResponse[]> {
@@ -848,7 +850,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       .from(providerAccounts)
       .where(globalOrOwnedBy(providerAccounts.tenantId, tenantId))
       .orderBy(asc(providerAccounts.sortIndex), asc(providerAccounts.createdAt), asc(providerAccounts.id));
-    return this.accountsWithUsage(tenantId, rows);
+    return this.accountsWithUsage(this.db, tenantId, rows);
   }
 
   async createAccount(
@@ -857,7 +859,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     request: CreateProviderAccountRequest,
   ): Promise<ProviderAccountResponse> {
     try {
-      return await this.db.transaction(async (tx) => {
+      const createdRow = await this.db.transaction(async (tx) => {
         let effectiveSecret = request.secret;
         let effectiveCredentialKind = request.credentialKind;
         const requestedCredentialMode: CredentialMode = request.credentialMode ?? "auto";
@@ -990,10 +992,16 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
           );
         }
 
-        const [account] = await this.accountsWithUsage(tenantId, [row]);
-        if (!account) throw new Error("created provider account could not be mapped");
-        return account;
+        return row;
       });
+
+      // Usage enrichment runs AFTER the transaction commits: PGlite serves a single
+      // connection, and a telemetry read issued while the transaction is still open
+      // never returns — the process wedges with no error and no log, and every later
+      // DB-backed request queues behind it.
+      const [account] = await this.accountsWithUsage(this.db, tenantId, [createdRow]);
+      if (!account) throw new Error("created provider account could not be mapped");
+      return account;
     } catch (error) {
       if (isUniqueViolation(error)) {
         throw new ConsoleDomainError(
@@ -1061,7 +1069,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       if (patch.secret !== undefined || patch.status !== undefined) {
         invalidateCredentialCache(accountId);
       }
-      const [account] = await this.accountsWithUsage(tenantId, [row]);
+      const [account] = await this.accountsWithUsage(this.db, tenantId, [row]);
       return account;
     } catch (error) {
       if (isUniqueViolation(error)) {
